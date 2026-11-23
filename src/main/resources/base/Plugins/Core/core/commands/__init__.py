@@ -10,7 +10,8 @@ from core.quicksearch_matchers import contains_chars, \
 from fman import *
 from fman.fs import exists, touch, mkdir, is_dir, delete, samefile, copy, \
 	iterdir, resolve, prepare_copy, prepare_move, prepare_delete, \
-	FileSystem, prepare_trash, query, makedirs, notify_file_added
+	FileSystem, prepare_trash, query, makedirs, notify_file_added, \
+	notify_file_removed
 from fman.impl.util import get_user
 from fman.url import splitscheme, as_url, join, basename, as_human_readable, \
 	dirname, relpath, normalize
@@ -19,7 +20,7 @@ from itertools import chain
 from os import strerror
 from os.path import basename, pardir
 from pathlib import PurePath
-from PyQt5.QtCore import QUrl
+from PyQt5.QtCore import QFile, QUrl
 from PyQt5.QtGui import QDesktopServices
 from subprocess import Popen, DEVNULL, PIPE
 from tempfile import TemporaryDirectory
@@ -122,7 +123,7 @@ class _Delete(Task):
 	def __init__(self, urls, prepare_fn, fallback=None):
 		super().__init__('Deleting ' + _describe(urls))
 		self._urls = urls
-		self._num_urls_prepared = 0
+		self._url_being_prepared = None
 		self._prepare_fn = prepare_fn
 		self._fallback = fallback
 		self._tasks = []
@@ -130,10 +131,9 @@ class _Delete(Task):
 		try:
 			self._gather_tasks()
 		except (UnsupportedOperation, NotImplementedError):
-			failing_url = self._urls[self._num_urls_prepared]
 			self.show_alert(
 				'Deleting files in %s is not supported.'
-				% splitscheme(failing_url)[0]
+				% splitscheme(self._url_being_prepared)[0]
 			)
 			return
 		ignore_errors = False
@@ -166,14 +166,25 @@ class _Delete(Task):
 					if choice & YES_TO_ALL:
 						ignore_errors = True
 	def _gather_tasks(self):
-		for url in self._urls:
+		urls = self._urls
+		if PLATFORM == 'Mac' and self._prepare_fn is prepare_trash:
+			# Trashing a file on Mac means a synchronous round trip to Finder.
+			# Doing this once per file is very slow. So send local files to
+			# Finder in batches:
+			is_local = lambda url: splitscheme(url)[0] == 'file://'
+			local_urls = [url for url in urls if is_local(url)]
+			for i in range(0, len(local_urls), _MAC_TRASH_BATCH_SIZE):
+				batch = local_urls[i:i + _MAC_TRASH_BATCH_SIZE]
+				self._tasks.append(_TrashOnMac(batch))
+			urls = [url for url in urls if not is_local(url)]
+		for url in urls:
+			self._url_being_prepared = url
 			try:
 				self._prepare(url, self._prepare_fn)
 			except (NotImplementedError, UnsupportedOperation):
 				if self._fallback is None:
 					raise
 				self._prepare(url, self._fallback)
-			self._num_urls_prepared += 1
 		self.set_size(sum(t.get_size() for t in self._tasks))
 	def _prepare(self, url, prepare_fn):
 		url_tasks = []
@@ -184,6 +195,56 @@ class _Delete(Task):
 				num = len(self._tasks) + len(url_tasks)
 				self.set_text('Preparing to delete {:,} files.'.format(num))
 		self._tasks.extend(url_tasks)
+
+_MAC_TRASH_BATCH_SIZE = 100
+
+class _TrashOnMac(Task):
+	def __init__(self, urls):
+		super().__init__('Deleting ' + _describe(urls), size=len(urls))
+		self._urls = urls
+	def __call__(self):
+		from osxtrash import move_to_trash
+		urls = [url for url in self._urls if os.path.lexists(_os_path(url))]
+		# osxtrash follows symlinks. If one is broken, it aborts the batch. So
+		# trash broken symlinks separately via Qt, which doesn't follow them:
+		is_broken_link = lambda url: not os.path.exists(_os_path(url))
+		broken_links = [url for url in urls if is_broken_link(url)]
+		batch = [url for url in urls if url not in broken_links]
+		for url in broken_links:
+			QFile.moveToTrash(_os_path(url))
+		status = 0
+		if batch:
+			try:
+				# The C extension returns a status code although its
+				# documentation says it raises OSError. Handle both:
+				status = move_to_trash(*map(_os_path, batch))
+			except OSError as e:
+				status = e.errno or -1
+		# A failed batch may still have trashed some of the files:
+		num_failed = 0
+		for url in urls:
+			if os.path.lexists(_os_path(url)):
+				num_failed += 1
+			else:
+				notify_file_removed(url)
+		if num_failed:
+			reason = _OSXTRASH_ERRORS.get(status, 'Could not move to trash')
+			reason += ' (%d of %d files were not deleted)' % \
+					  (num_failed, len(urls))
+			# Don't use status as errno. Eg. 2 would become FileNotFoundError,
+			# which _Delete silently ignores:
+			raise OSError(errno.EIO, reason)
+
+def _os_path(url):
+	return splitscheme(url)[1]
+
+_OSXTRASH_ERRORS = {
+	1: 'Invalid path',
+	2: 'Path does not exist',
+	3: 'Could not get file privileges',
+	4: 'Could not move to trash',
+	5: 'Some files were not moved to trash'
+}
 
 def _describe(files, template='%d files'):
 	if len(files) == 1:

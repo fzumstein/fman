@@ -1,11 +1,16 @@
 from core.commands import History, Move, _from_human_readable, \
-	get_dest_suggestion, _find_extension_start, _get_shortcuts_for_command
+	get_dest_suggestion, _find_extension_start, _get_shortcuts_for_command, \
+	_TrashOnMac
 from core.tests import StubUI
 from core.util import filenotfounderror
 from fman import OK, YES, NO, PLATFORM
 from fman.url import join, as_human_readable, as_url, dirname
-from unittest import TestCase
+from tempfile import TemporaryDirectory
+from unittest import TestCase, skipIf
+from unittest.mock import patch
 
+import core.commands
+import errno
 import os
 import os.path
 
@@ -281,3 +286,57 @@ class HistoryTest(TestCase):
 	def _go_to(self, *paths):
 		for path in paths:
 			self._history.path_changed(path)
+
+@skipIf(PLATFORM != 'Mac', 'Skip Mac-only test')
+class TrashOnMacTest(TestCase):
+	def test_trash(self):
+		missing = join(self._urls[0], 'missing')
+		_TrashOnMac(self._urls + [missing])()
+		self.assertEqual(self._urls, self._removed)
+		for url in self._urls:
+			self.assertFalse(os.path.lexists(as_human_readable(url)))
+	def test_broken_symlink(self):
+		link = os.path.join(self._tmp_dir.name, 'broken')
+		os.symlink(os.path.join(self._tmp_dir.name, 'nonexistent'), link)
+		# The symlink must not abort trashing the files after it:
+		urls = [as_url(link)] + self._urls
+		_TrashOnMac(urls)()
+		self.assertEqual(urls, self._removed)
+		for url in urls:
+			self.assertFalse(os.path.lexists(as_human_readable(url)))
+	def test_partial_failure(self):
+		def move_to_trash(*paths):
+			os.remove(paths[0])
+			return 5
+		with patch('osxtrash.move_to_trash', move_to_trash):
+			with self.assertRaises(OSError) as cm:
+				_TrashOnMac(self._urls)()
+		# Must not be FileNotFoundError, which _Delete silently ignores:
+		self.assertEqual(errno.EIO, cm.exception.errno)
+		self.assertIn('2 of 3 files', cm.exception.strerror)
+		self.assertEqual(self._urls[:1], self._removed)
+	def test_documented_oserror(self):
+		def move_to_trash(*paths):
+			raise OSError(4, 'Could not move to trash')
+		with patch('osxtrash.move_to_trash', move_to_trash):
+			with self.assertRaises(OSError) as cm:
+				_TrashOnMac(self._urls)()
+		self.assertEqual(errno.EIO, cm.exception.errno)
+		self.assertEqual([], self._removed)
+	def setUp(self):
+		super().setUp()
+		self._tmp_dir = TemporaryDirectory()
+		self._urls = []
+		for i in range(3):
+			path = os.path.join(self._tmp_dir.name, 'file%d.txt' % i)
+			open(path, 'w').close()
+			self._urls.append(as_url(path))
+		self._removed = []
+		patcher = patch.object(
+			core.commands, 'notify_file_removed', self._removed.append
+		)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+	def tearDown(self):
+		self._tmp_dir.cleanup()
+		super().tearDown()
